@@ -1,0 +1,19 @@
+services:
+  builder:
+    # Reuse i3More's build environment (Ubuntu 24.04 + Rust + libgtk-4-dev +
+    # transitive GTK -dev libs). Override I3MORE_DIR if the sibling repo
+    # lives somewhere other than ../i3More.
+    build:
+      context: ${I3MORE_DIR:-../i3More}
+      dockerfile: Dockerfile
+    image: whisper-stt-builder:latest
+    working_dir: /app
+    volumes:
+      - .:/app
+      - ./dist:/app/dist
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-target:/app/target
+
+volumes:
+  cargo-registry:
+  cargo-target:

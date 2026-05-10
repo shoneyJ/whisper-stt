@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Shoney Arickathil"]
+repository = "https://github.com/shoneyj/whisper-stt"
+rust-version = "1.93"
+
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+env_logger = "0.11"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "process", "time", "signal"] }
+whisper-stt-proto = { path = "crates/whisper-stt-proto" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

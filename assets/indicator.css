@@ -1,0 +1,43 @@
+/* whisper-stt indicator — Gruvbox-dark inspired, port of an i3More subset.
+ *
+ * Loaded by crates/whisperd/src/indicator.rs (only with --features gui).
+ * The window class is `indicator-window`; the state-pill label is
+ * `indicator-label` with one of `state-idle`, `state-listening`,
+ * `state-transcribing`, `state-error`.
+ */
+
+window.indicator-window {
+    background: rgba(40, 40, 40, 0.92);
+    border: 1px solid #3c3836;
+    border-radius: 12px;
+    padding: 0;
+}
+
+label.indicator-label {
+    font-family: "JetBrains Mono", "Fira Code", monospace;
+    font-size: 11pt;
+    font-weight: 600;
+    padding: 6px 14px;
+    border-radius: 12px;
+    color: #ebdbb2;
+    background: transparent;
+}
+
+/* State colours — match the conventional traffic-light intuition.            */
+
+label.indicator-label.state-idle {
+    color: #a89984;
+}
+
+label.indicator-label.state-listening {
+    color: #fb4934;          /* red — recording */
+}
+
+label.indicator-label.state-transcribing {
+    color: #fabd2f;          /* yellow — busy */
+}
+
+label.indicator-label.state-error {
+    color: #fb4934;
+    background: rgba(251, 73, 52, 0.18);
+}

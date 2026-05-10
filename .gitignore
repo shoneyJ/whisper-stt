@@ -1,0 +1,22 @@
+.agents/
+
+# Rust
+/target/
+**/*.rs.bk
+
+# Python worker
+worker/.venv/
+**/__pycache__/
+**/*.pyc
+*.egg-info/
+
+# Editor / IDE
+.vscode/
+.idea/
+
+# Docker build artefacts
+/dist/*
+!/dist/.gitkeep
+
+# Misc
+.DS_Store
