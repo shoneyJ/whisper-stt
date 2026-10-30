@@ -1,0 +1,32 @@
+# id	app	expected (Debug of command::Parsed)	say this
+# Recordings: <id>.wav next to this file (scripts/record-commands.sh).
+# Sessions assumed by the eval: dotfiles, main, done.
+wake-alone	terminal	WakeOnly	Jarvis.
+hey-wake-alone	terminal	WakeOnly	Hey Jarvis.
+session-main	terminal	Command(Tmux(Switch("main")))	Jarvis, switch to session main.
+session-dotfiles	terminal	Command(Tmux(Switch("dotfiles")))	Jarvis, session dotfiles.
+next-session	terminal	Command(Tmux(Next))	Jarvis, next session.
+go-back-terminal	terminal	Command(Tmux(Previous))	Jarvis, go back.
+new-window	terminal	Command(Tmux(NewWindow))	Jarvis, new window.
+window-two	terminal	Command(Tmux(Window(2)))	Jarvis, window two.
+next-window	terminal	Command(Tmux(NextWindow))	Jarvis, next window.
+split-right	terminal	Command(Tmux(Split(Right)))	Jarvis, split right.
+split-down	terminal	Command(Tmux(Split(Down)))	Jarvis, split down.
+pane-left	terminal	Command(Tmux(Pane(Left)))	Jarvis, pane left.
+zoom-pane	terminal	Command(Tmux(Zoom))	Jarvis, zoom pane.
+scroll-up	terminal	Command(Tmux(ScrollUp))	Jarvis, scroll up.
+enter	terminal	Command(Key(Enter))	Jarvis, enter.
+run-it	terminal	Command(Key(Enter))	Jarvis, run it.
+cancel	terminal	Command(Key(Cancel))	Jarvis, cancel.
+clear-line	terminal	Command(Key(ClearLine))	Jarvis, clear line.
+listen	terminal	Command(StartDictation)	Jarvis, listen.
+focus-browser	terminal	Command(Niri(Focus(Browser)))	Jarvis, browser.
+focus-terminal	browser	Command(Niri(Focus(Terminal)))	Jarvis, terminal.
+workspace-three	terminal	Command(Niri(Workspace("3")))	Jarvis, workspace three.
+maximize	terminal	Command(Niri(Maximize))	Jarvis, maximize.
+new-tab	browser	Command(Browser(NewTab))	Jarvis, new tab.
+tab-three	browser	Command(Browser(Tab(3)))	Jarvis, tab three.
+go-back-browser	browser	Command(Browser(Back))	Jarvis, go back.
+reload	browser	Command(Browser(Reload))	Jarvis, reload.
+not-for-us	terminal	NotWake	Jarvis was great at the meeting.
+chatter	terminal	NotWake	I was talking about the weather today.

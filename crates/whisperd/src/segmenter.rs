@@ -1,157 +1,147 @@
-//! Streaming segmenter for hold-to-talk dictation.
+//! Watches the live capture while listening.
 //!
-//! While the daemon is in `Listening` state, this task watches the live
-//! parec buffer, runs the existing energy-based VAD on a rolling 500 ms
-//! window, and submits a transcribe-and-inject job each time the speaker
-//! takes a breath (≥ ~400 ms of silence after speech). The actor task
-//! handles the transcribe + xdotool inject; we stay decoupled from the
-//! worker via the same mpsc channel that carries IPC commands.
+//! Every [`TICK`] it measures the new audio with the [`VoiceTracker`] and:
 //!
-//! The final tail of audio after F9 release is **not** flushed by the
-//! segmenter — the actor's `handle_stop` does that directly, using the
-//! shared `last_committed_pos` to know where to start.
+//! - **commits a piece** once voice has paused for [`PAUSE_MS`]: the audio
+//!   since the last commit goes to the transcriber, so text appears clause
+//!   by clause while you keep talking
+//! - **publishes the mic level** for the bar pill (~20 Hz)
+//! - **asks the daemon to auto-stop** once no voice has been heard for the
+//!   silence timeout. Measured in captured audio, not wall-clock time, so a
+//!   stalled device is never mistaken for a quiet speaker (as in Myna's
+//!   `silence-timeout`)
+//!
+//! Only audio that contained voice is ever committed; the tail after the
+//! final toggle is handled by the daemon with [`Outcome::voice_in_tail`].
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
-use crate::ipc::InternalCmd;
-use crate::vad;
+use crate::ipc::{InternalCmd, Level};
+use crate::transcriber::Job;
+use crate::voice::{self, VoiceTracker};
 
-/// How often the segmenter polls the buffer.
-const TICK_INTERVAL: Duration = Duration::from_millis(100);
-
-/// Length of the rolling window the VAD inspects. 500 ms is short enough
-/// to detect natural pauses, long enough to be stable against per-chunk
-/// noise.
-const VAD_WINDOW_SAMPLES: usize = 8_000; // 500 ms @ 16 kHz
-
-/// Don't commit a segment shorter than this — avoids a flurry of empty
-/// transcribes when the user holds F9 silently.
-const MIN_SEGMENT_SAMPLES: usize = 4_800; // 300 ms
+/// 50 ms: the level meter updates at ~20 Hz.
+const TICK: Duration = Duration::from_millis(50);
+/// Silence after voice that ends a piece. Long enough for a breath between
+/// words not to split a sentence, short enough to feel live.
+const PAUSE_MS: u64 = 500;
+/// The level covers the last 100 ms of audio.
+const LEVEL_SAMPLES: usize = 1_600;
 
 pub struct SegmenterHandle {
-    stop_tx: Option<oneshot::Sender<()>>,
-    join: tokio::task::JoinHandle<()>,
-    /// Where the segmenter has committed up to. The actor reads this in
-    /// `handle_stop` to figure out which tail of the buffer still needs
-    /// to be transcribed as the final segment.
-    pub last_committed: Arc<AtomicUsize>,
+    stop_tx: oneshot::Sender<()>,
+    join: tokio::task::JoinHandle<Outcome>,
+}
+
+/// What the segmenter knew when it stopped.
+pub struct Outcome {
+    tracker: VoiceTracker,
+    /// Samples already fed to `tracker`.
+    measured: usize,
+    /// Samples already committed as pieces.
+    pub committed: usize,
+}
+
+impl Outcome {
+    /// Measure the audio captured after the last tick, then report whether
+    /// the uncommitted tail contains voice.
+    pub fn voice_in_tail(&mut self, pcm: &[i16]) -> bool {
+        if self.measured < pcm.len() {
+            self.tracker.push(&pcm[self.measured..]);
+            self.measured = pcm.len();
+        }
+        let committed_ms = self.committed as u64 / 16;
+        self.tracker
+            .last_voice_ms()
+            .is_some_and(|v| v > committed_ms)
+    }
 }
 
 impl SegmenterHandle {
-    pub async fn stop(mut self) {
-        if let Some(tx) = self.stop_tx.take() {
-            let _ = tx.send(());
-        }
-        let _ = self.join.await;
+    pub async fn stop(self) -> Outcome {
+        let _ = self.stop_tx.send(());
+        self.join.await.expect("segmenter task panicked")
     }
 }
 
-/// Spawn the segmenter task. `buf` is the shared parec accumulator;
-/// `cmd_tx` is the actor's command channel — segments are submitted via
-/// `InternalCmd::TranscribeSegment`.
-pub fn spawn(
-    buf: Arc<Mutex<Vec<i16>>>,
-    cmd_tx: mpsc::Sender<InternalCmd>,
-) -> SegmenterHandle {
-    let (stop_tx, stop_rx) = oneshot::channel::<()>();
-    let last_committed = Arc::new(AtomicUsize::new(0));
-    let last_committed_for_task = last_committed.clone();
-
-    let join = tokio::spawn(async move {
-        run(buf, cmd_tx, stop_rx, last_committed_for_task).await;
-    });
-
-    SegmenterHandle {
-        stop_tx: Some(stop_tx),
-        join,
-        last_committed,
-    }
+pub struct Wiring {
+    pub buf: Arc<Mutex<Vec<i16>>>,
+    pub jobs: mpsc::UnboundedSender<Job>,
+    pub cmd_tx: mpsc::Sender<InternalCmd>,
+    pub level: Arc<watch::Sender<Level>>,
+    /// `None` disables auto-stop.
+    pub silence_timeout: Option<Duration>,
 }
 
-async fn run(
-    buf: Arc<Mutex<Vec<i16>>>,
-    cmd_tx: mpsc::Sender<InternalCmd>,
-    mut stop_rx: oneshot::Receiver<()>,
-    last_committed: Arc<AtomicUsize>,
-) {
-    let mut tick = tokio::time::interval(TICK_INTERVAL);
-    tick.tick().await; // skip immediate first tick
-    let mut in_speech = false;
+pub fn spawn(w: Wiring) -> SegmenterHandle {
+    let (stop_tx, stop_rx) = oneshot::channel();
+    let join = tokio::spawn(run(w, stop_rx));
+    SegmenterHandle { stop_tx, join }
+}
+
+async fn run(w: Wiring, mut stop_rx: oneshot::Receiver<()>) -> Outcome {
+    let mut out = Outcome {
+        tracker: VoiceTracker::default(),
+        measured: 0,
+        committed: 0,
+    };
+    let mut asked_to_stop = false;
+    let mut tick = tokio::time::interval(TICK);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
             biased;
-            _ = &mut stop_rx => {
-                log::debug!("segmenter: stop signal received");
-                return;
+            _ = &mut stop_rx => break,
+            _ = tick.tick() => {}
+        }
+
+        let (fresh, recent, total) = {
+            let buf = w.buf.lock().expect("capture buffer mutex poisoned");
+            let total = buf.len();
+            let fresh = buf[out.measured.min(total)..].to_vec();
+            let recent = voice::level(&buf[total.saturating_sub(LEVEL_SAMPLES)..]);
+            (fresh, recent, total)
+        };
+        out.tracker.push(&fresh);
+        out.measured = total;
+        let _ = w.level.send(Level {
+            rms: recent.0,
+            peak: recent.1,
+        });
+
+        let position = out.tracker.position_ms();
+        let committed_ms = out.committed as u64 / 16;
+        let last_voice = out.tracker.last_voice_ms();
+
+        let paused_after_voice =
+            last_voice.is_some_and(|v| v > committed_ms && position.saturating_sub(v) >= PAUSE_MS);
+        if paused_after_voice && total - out.committed >= crate::transcriber::MIN_DECODE_SAMPLES {
+            let piece =
+                w.buf.lock().expect("capture buffer mutex poisoned")[out.committed..total].to_vec();
+            log::info!(
+                "segmenter: piece of {} ms at a pause",
+                piece.len() as u64 / 16
+            );
+            out.committed = total;
+            if w.jobs.send(Job::Segment(piece)).is_err() {
+                log::warn!("segmenter: transcriber gone");
+                break;
             }
-            _ = tick.tick() => {
-                if let Some(segment) = check_for_commit(&buf, &last_committed, &mut in_speech) {
-                    log::info!(
-                        "segmenter: committing {} samples ({} ms) at pause",
-                        segment.len(),
-                        segment.len() * 1000 / 16_000
-                    );
-                    if cmd_tx
-                        .send(InternalCmd::TranscribeSegment(segment))
-                        .await
-                        .is_err()
-                    {
-                        log::warn!("segmenter: actor channel closed; exiting");
-                        return;
-                    }
-                }
+        }
+
+        if let (Some(limit), false) = (w.silence_timeout, asked_to_stop) {
+            let quiet_ms = position.saturating_sub(last_voice.unwrap_or(0));
+            if quiet_ms >= limit.as_millis() as u64 {
+                asked_to_stop = true;
+                log::info!("segmenter: {} s without voice; auto-stop", quiet_ms / 1000);
+                let _ = w.cmd_tx.send(InternalCmd::AutoStop).await;
             }
         }
     }
-}
-
-/// Inspect the latest VAD window. If we just transitioned from speech to
-/// silence and have ≥ MIN_SEGMENT_SAMPLES of un-committed audio, return
-/// the segment; else return None and update the speech flag.
-fn check_for_commit(
-    buf: &Arc<Mutex<Vec<i16>>>,
-    last_committed: &Arc<AtomicUsize>,
-    in_speech: &mut bool,
-) -> Option<Vec<i16>> {
-    let guard = buf.lock().expect("segmenter buf mutex poisoned");
-    let total = guard.len();
-
-    if total < VAD_WINDOW_SAMPLES {
-        return None; // not enough audio yet
-    }
-
-    let win_start = total - VAD_WINDOW_SAMPLES;
-    let window: Vec<f32> = guard[win_start..total]
-        .iter()
-        .map(|&s| s as f32 / 32768.0)
-        .collect();
-
-    let is_silent = vad::is_chunk_silent(
-        &window,
-        16_000,
-        vad::DEFAULT_FREQ_THOLD_HZ,
-        vad::DEFAULT_SILENCE_ENERGY_THOLD,
-    );
-
-    let prev = *in_speech;
-    *in_speech = !is_silent;
-
-    if !(prev && is_silent) {
-        return None; // not a speech→silence transition
-    }
-
-    // Speech just ended. Commit from last_committed to current total.
-    let committed = last_committed.load(Ordering::Relaxed);
-    if total <= committed || total - committed < MIN_SEGMENT_SAMPLES {
-        return None;
-    }
-    let segment = guard[committed..total].to_vec();
-    last_committed.store(total, Ordering::Relaxed);
-    Some(segment)
+    let _ = w.level.send(Level::default());
+    out
 }

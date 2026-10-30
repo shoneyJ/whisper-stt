@@ -40,13 +40,23 @@ impl ParecCapture {
     /// buffer.
     pub fn start(source: Option<&str>) -> Result<Self, String> {
         let mut cmd = Command::new("parec");
-        cmd.args(["--format=s16le", "--rate=16000", "--channels=1", "--raw"]);
+        // 50 ms latency: small reads keep the level meter and pause
+        // detection live (the server default can buffer far longer).
+        cmd.args([
+            "--format=s16le",
+            "--rate=16000",
+            "--channels=1",
+            "--raw",
+            "--latency-msec=50",
+        ]);
         if let Some(src) = source {
             cmd.args(["--device", src]);
         }
         let mut child = cmd
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            // Errors (no such source, server gone) go to the daemon's log
+            // instead of vanishing.
+            .stderr(Stdio::inherit())
             .spawn()
             .map_err(|e| format!("spawn parec: {e}"))?;
 

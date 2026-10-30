@@ -1,0 +1,28 @@
+# whisper-stt daemon as a systemd user service.
+# Installed by `just install-service`; see doc/plan/05-build-install.md.
+#
+# No WorkingDirectory or path env vars needed: whisperd finds the worker venv
+# in the repo it was built from (WHISPER_STT_PYTHON / _WORKER_SCRIPT override).
+# WAYLAND_DISPLAY comes from the user manager's environment, which niri
+# imports at login; wtype needs it to type into the focused window.
+[Unit]
+Description=whisper-stt dictation daemon
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/whisperd
+Restart=on-failure
+RestartSec=2
+Environment=RUST_LOG=info
+# Silent: the DankMaterialShell pill shows every state (tint, level bar,
+# ripple, check/cross), and sounds after each command or dictation
+# distracted. Remove to get start/stop/error sounds back.
+Environment=WHISPER_STT_SOUNDS=0
+# Optional overrides, e.g.:
+# Environment=WHISPER_STT_SILENCE_TIMEOUT_SECS=30
+# Environment=WHISPER_STT_SOURCE=alsa_input.pci-...
+
+[Install]
+WantedBy=graphical-session.target

@@ -91,10 +91,30 @@ class Worker:
             return
 
         t0 = time.monotonic()
+        # Hallucination guards. With faster-whisper's defaults, near-silent
+        # audio came back as "Thank you." The daemon already skips audio
+        # without voice; these handle what still slips through. Values follow
+        # Canonical Myna's measurements for large models
+        # (server/src/myna/testbed/whisper.py):
         segments, info = self.model.transcribe(
             audio,
             language=self.language,
             beam_size=self.beam_size,
+            # A confident "You"/"Thank you." at the default -1.0 overrides the
+            # no-speech skip; -0.5 took silence hallucinations from 5/12 to
+            # 0/12 with no WER change.
+            log_prob_threshold=-0.5,
+            # Fewer, cooler retries: high-temperature fallbacks invent text.
+            temperature=(0.0, 0.2),
+            # On large-v3 models, conditioning on earlier text caused
+            # repetition loops ("…musicians…" ×30).
+            condition_on_previous_text=False,
+            # Silero VAD trims trailing silence, which is where the stray
+            # "Thank you." comes from on large-v3 models.
+            vad_filter=True,
+            # Optional bias towards expected words (wake phrase, tmux
+            # session names). Dictation sends none.
+            hotwords=cmd.get("hotwords"),
         )
         text = " ".join(seg.text.strip() for seg in segments).strip()
         elapsed_ms = int((time.monotonic() - t0) * 1000)

@@ -6,9 +6,11 @@
 //! - **Command arm** (`start`/`stop`/`status`/`quit`) — request/response,
 //!   one-shot. Forwarded to the daemon main task via `cmd_tx`; reply is
 //!   read from a oneshot channel and written back; connection closes.
-//! - **Event arm** (`subscribe`) — long-lived. The handler clones a
-//!   `watch::Receiver<DaemonStatus>` and streams `CtlEvent::StateChanged`
-//!   on every state transition until the peer disconnects.
+//!   `toggle` is answered at once and handed to the key-repeat filter
+//!   (`crate::toggle`), which forwards one `InternalCmd::Toggle` per press.
+//! - **Event arm** (`subscribe`) — long-lived. The handler streams
+//!   `CtlEvent::StateChanged` on every state transition and `CtlEvent::Level`
+//!   while listening, until the peer disconnects.
 //!
 //! The actor pattern is preserved: state-mutating commands go through the
 //! mpsc; subscriptions never enter the actor at all (they only read the
@@ -24,13 +26,47 @@ use whisper_stt_proto::{
     CtlCommand, CtlEvent, CtlResponse, DaemonStatus, DEFAULT_SOCKET_REL_PATH, SOCKET_PATH_ENV,
 };
 
+use crate::audio::CaptureSession;
+use crate::toggle::Poker;
+
 /// Messages routed into the daemon main loop.
 pub enum InternalCmd {
     Ipc(CtlCommand, oneshot::Sender<CtlResponse>),
-    IdleTick,
-    /// Segmenter detected a pause; transcribe + inject this audio segment.
-    /// Sent by `crate::segmenter` while the daemon is in `Listening`.
-    TranscribeSegment(Vec<i16>),
+    /// One accepted press from the key-repeat filter.
+    Toggle,
+    /// The microphone warm-up for session `generation` finished.
+    CaptureReady {
+        generation: u64,
+        result: Result<CaptureSession, String>,
+    },
+    /// The segmenter heard no voice for the silence timeout, or the user
+    /// said "stop dictation".
+    AutoStop,
+    WorkerLoaded(bool),
+    /// The model failed to load for the session being started.
+    WorkerFailed(String),
+    /// The session's tail is done: `Ok(typed anything this session)`.
+    TailDone(Result<bool, String>),
+    /// A notice shown for session `generation` has been up long enough.
+    NoticeExpired(u64),
+    /// News from the wake-phrase listener.
+    Wake(crate::wake::WakeEvent),
+}
+
+/// Mic level published while listening (see `CtlEvent::Level`).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Level {
+    pub rms: f32,
+    pub peak: f32,
+}
+
+/// What each client connection needs from the daemon.
+#[derive(Clone)]
+pub struct Shared {
+    pub cmd_tx: mpsc::Sender<InternalCmd>,
+    pub poker: Poker,
+    pub status: watch::Receiver<DaemonStatus>,
+    pub level: watch::Receiver<Level>,
 }
 
 pub fn default_socket_path() -> Result<PathBuf> {
@@ -41,11 +77,7 @@ pub fn default_socket_path() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(DEFAULT_SOCKET_REL_PATH))
 }
 
-pub async fn handle_client(
-    stream: UnixStream,
-    cmd_tx: mpsc::Sender<InternalCmd>,
-    watch_rx: watch::Receiver<DaemonStatus>,
-) -> Result<()> {
+pub async fn handle_client(stream: UnixStream, shared: Shared) -> Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
     let mut line = String::new();
@@ -66,8 +98,12 @@ pub async fn handle_client(
     };
 
     match cmd {
-        CtlCommand::Subscribe => handle_subscribe(write_half, watch_rx).await,
-        other => handle_one_shot(write_half, other, cmd_tx).await,
+        CtlCommand::Subscribe => handle_subscribe(write_half, shared.status, shared.level).await,
+        CtlCommand::Toggle => {
+            shared.poker.poke();
+            write_response(&mut write_half, &CtlResponse::Ok).await
+        }
+        other => handle_one_shot(write_half, other, shared.cmd_tx).await,
     }
 }
 
@@ -95,6 +131,7 @@ async fn handle_one_shot<W: AsyncWriteExt + Unpin>(
 async fn handle_subscribe<W: AsyncWriteExt + Unpin>(
     mut write_half: W,
     mut watch_rx: watch::Receiver<DaemonStatus>,
+    mut level_rx: watch::Receiver<Level>,
 ) -> Result<()> {
     // Send the current state immediately so the subscriber does not have to
     // wait for the next transition to know what state the daemon is in.
@@ -110,19 +147,29 @@ async fn handle_subscribe<W: AsyncWriteExt + Unpin>(
         }
     }
 
-    // Stream every subsequent transition.
-    while watch_rx.changed().await.is_ok() {
-        let status = watch_rx.borrow_and_update().clone();
-        if write_event(&mut write_half, &event_for(status))
-            .await
-            .is_err()
-        {
-            // Peer disconnected. Drop the receiver and exit cleanly.
-            return Ok(());
+    level_rx.borrow_and_update();
+
+    // Stream every subsequent transition and level update.
+    loop {
+        let event = tokio::select! {
+            changed = watch_rx.changed() => {
+                if changed.is_err() {
+                    return Ok(()); // daemon shutting down
+                }
+                event_for(watch_rx.borrow_and_update().clone())
+            }
+            changed = level_rx.changed() => {
+                if changed.is_err() {
+                    return Ok(());
+                }
+                let l = *level_rx.borrow_and_update();
+                CtlEvent::Level { rms: l.rms, peak: l.peak }
+            }
+        };
+        if write_event(&mut write_half, &event).await.is_err() {
+            return Ok(()); // peer disconnected
         }
     }
-    // Sender dropped → daemon is shutting down. Exit silently.
-    Ok(())
 }
 
 fn event_for(status: DaemonStatus) -> CtlEvent {
@@ -130,6 +177,8 @@ fn event_for(status: DaemonStatus) -> CtlEvent {
         state: status.state,
         worker_loaded: status.worker_loaded,
         idle_seconds: status.idle_seconds,
+        message: status.message,
+        ok: status.ok,
     }
 }
 

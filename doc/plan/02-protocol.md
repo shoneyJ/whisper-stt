@@ -87,6 +87,7 @@ host                            worker
 | `cmd`     | string  | yes      | always `"transcribe"`                                                                                  |
 | `pcm_b64` | string  | yes      | base64 of **little-endian signed 16-bit PCM**, mono, no header                                         |
 | `sr`      | integer | yes      | sample rate in Hz; v1 requires `16000`                                                                 |
+| `hotwords` | string | no       | words to bias decoding towards (faster-whisper `hotwords`); sent only by the wake listener (see 07)  |
 
 The worker decodes via `numpy.frombuffer(base64.b64decode(...), dtype="<i2").astype(np.float32) / 32768.0`.
 
@@ -154,8 +155,11 @@ Free-form text. The daemon should redirect it to its own log at `info` or `debug
 
 - Unix socket at `${WHISPER_STT_SOCK:-$HOME/.cache/whisper-stt/whisperd.sock}`.
 - The verb on the first NDJSON line dispatches between two arms:
-  - **Command arm** (`start`/`stop`/`status`/`quit`) — request/response,
+  - **Command arm** (`start`/`stop`/`toggle`/`status`/`quit`) — request/response,
     one-shot. Client half-closes write end, reads one response line, closes.
+    `toggle` is answered `ok` at once and passed through the key-repeat
+    filter (`toggle.rs`, see `06-niri-toggle-ux.md`), so a held or bounced
+    key toggles once.
   - **Event arm** (`subscribe`) — long-lived. Daemon emits one event line
     immediately (the current state) and then one per state transition until
     the client disconnects. The client never writes again on this connection.
@@ -170,9 +174,11 @@ Free-form text. The daemon should redirect it to its own log at `info` or `debug
 
 | Command  | Body                | Effect                                                                   |
 | -------- | ------------------- | ------------------------------------------------------------------------ |
-| `start`  | `{"cmd":"start"}`   | Spawn worker if not loaded; open mic capture. State → `listening`. Idempotent: a second `start` while already listening is a no-op. |
-| `stop`   | `{"cmd":"stop"}`    | Stop capture; send PCM to worker; inject transcript. State → `idle`. Idempotent: `stop` with no active capture is a no-op. |
+| `start`  | `{"cmd":"start"}`   | From `idle`/`notice`/`error`: load the worker (if needed) and open the mic in parallel. State → `starting`, then `listening` once the mic delivers audio. A no-op otherwise. |
+| `stop`   | `{"cmd":"stop"}`    | From `listening`: end capture, transcribe the tail (if it has voice), type it. State → `transcribing` → `idle`, or `notice` if nothing was typed. From `starting`: cancel → `idle`. A no-op otherwise. |
+| `toggle` | `{"cmd":"toggle"}`  | `start` or `stop`, decided by the current state; ignored while `transcribing`. Repeat-filtered. *(added for niri, see 06)* |
 | `status` | `{"cmd":"status"}`  | Read-only snapshot. Does *not* update the idle clock.                    |
+| `run`    | `{"cmd":"run","text":"switch to session main"}` | Parse `text` as a voice command (wake phrase optional) and run it on tmux. Result shown as a `notice`; refused commands reply `error`. *(see 07)* |
 | `quit`   | `{"cmd":"quit"}`    | Reap capture + worker, remove the socket, exit.                          |
 
 ### Responses (one-shot arm)
@@ -187,9 +193,12 @@ Free-form text. The daemon should redirect it to its own log at `info` or `debug
 
 ```rust
 pub struct DaemonStatus {
-    pub state: DaemonState,        // "idle" | "listening" | "transcribing" | "error"
+    pub state: DaemonState,        // "idle" | "starting" | "listening" | "transcribing" | "notice" | "error" | "command"
+                                   // "command": wake word heard alone; message = focused app ("terminal" | "browser" | "other")
+    pub ok: Option<bool>,          // on a notice reporting a voice command: did it run? omitted otherwise
     pub worker_loaded: bool,
     pub idle_seconds: u64,
+    pub message: Option<String>,   // notice/error headline; omitted when None
 }
 ```
 
@@ -198,9 +207,11 @@ pub struct DaemonStatus {
 ```
 client → daemon:    {"cmd":"subscribe"}\n
 daemon → client:    {"event":"state_changed","state":"idle","worker_loaded":false,"idle_seconds":0}\n
+                    {"event":"state_changed","state":"starting","worker_loaded":true,"idle_seconds":2}\n
                     {"event":"state_changed","state":"listening","worker_loaded":true,"idle_seconds":2}\n
-                    {"event":"state_changed","state":"transcribing","worker_loaded":true,"idle_seconds":0}\n
-                    {"event":"state_changed","state":"idle","worker_loaded":true,"idle_seconds":0}\n
+                    {"event":"level","rms":0.031,"peak":0.12}\n          (~20 Hz while listening)
+                    {"event":"state_changed","state":"transcribing","worker_loaded":true,"idle_seconds":9}\n
+                    {"event":"state_changed","state":"notice","worker_loaded":true,"idle_seconds":0,"message":"No speech detected"}\n
                     ...
 ```
 
@@ -215,9 +226,13 @@ Semantics:
 - `idle_seconds` is a snapshot at the moment of the transition, not a live
   counter. Subscribers that need a live idle counter should compute it
   locally from a wall-clock timestamp, or call `status` on demand.
-- The daemon never writes anything other than `state_changed` events on a
-  subscribe connection. Future event types (e.g. `transcript`) would land
-  here as additional `CtlEvent::*` variants.
+- Besides `state_changed`, the daemon sends `level` events (mic RMS and
+  peak of the last ~100 ms, linear `[0, 1]`) about 20 times a second while
+  listening, and one with zeros when listening ends. A client that only
+  wants state can ignore them. *(added in 06)*
+- `message` is present on `notice` and `error` (e.g. "No speech
+  detected", "Microphone: …") and omitted otherwise, so subscribers written
+  before it existed still parse every event.
 - Termination: subscriber closes the socket → daemon's writer fails on the
   next `flush`, the per-connection task drops its receiver and exits. Or
   the daemon shuts down → `watch::Sender` is dropped, every subscriber's
@@ -233,7 +248,10 @@ pub enum CtlEvent {
         state: DaemonState,
         worker_loaded: bool,
         idle_seconds: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
     },
+    Level { rms: f32, peak: f32 },
 }
 ```
 

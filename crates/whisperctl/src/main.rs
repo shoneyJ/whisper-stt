@@ -35,6 +35,9 @@ fn run_one_shot(mut stream: UnixStream) -> Result<()> {
         CtlResponse::Ok => Ok(()),
         CtlResponse::Status(s) => {
             println!("{}", serde_json::to_string_pretty(&s)?);
+            if let Some(msg) = &s.message {
+                eprintln!("{msg}");
+            }
             Ok(())
         }
         CtlResponse::Error { msg } => bail!("{msg}"),
@@ -59,14 +62,24 @@ fn parse_args() -> Result<CtlCommand> {
     let mut args = std::env::args().skip(1);
     let verb = args
         .next()
-        .context("expected: start|stop|status|quit|subscribe")?;
+        .context("expected: start|stop|toggle|status|quit|subscribe|run <text>")?;
     Ok(match verb.as_str() {
         "start" => CtlCommand::Start,
         "stop" => CtlCommand::Stop,
+        "toggle" => CtlCommand::Toggle,
         "status" => CtlCommand::Status,
         "quit" => CtlCommand::Quit,
         "subscribe" => CtlCommand::Subscribe,
-        other => bail!("unknown command: {other:?} (expected start|stop|status|quit|subscribe)"),
+        "run" => {
+            let text = args.collect::<Vec<_>>().join(" ");
+            if text.is_empty() {
+                bail!("run needs a command, e.g.: whisperctl run switch to session main");
+            }
+            CtlCommand::Run { text }
+        }
+        other => {
+            bail!("unknown command: {other:?} (expected start|stop|toggle|status|quit|subscribe|run <text>)")
+        }
     })
 }
 

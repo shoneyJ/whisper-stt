@@ -339,11 +339,3 @@ binary stays small.
    terminal first; every cycle injects a transcript fragment.
    Tail `/tmp/whisperd.log` (or `journalctl --user -fu whisperd` if you
    set up the systemd unit) for errors during the run.
-
-
-Open VS codeHey Ubuntu open
-
-Testing one, two, three.
-So cool. So cool.
-
-Thank you.

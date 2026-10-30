@@ -26,7 +26,7 @@ We use `parec` (the PulseAudio compatibility tool, present on PipeWire systems
 via `pipewire-pulse`) for capture. The exact command:
 
 ```
-parec --format=s16le --rate=16000 --channels=1 --raw [--device <source>]
+parec --format=s16le --rate=16000 --channels=1 --raw --latency-msec=50 [--device <source>]
 ```
 
 `--device` is omitted by default so parec uses the system default source —
@@ -179,20 +179,22 @@ be added at the audio layer without touching the worker side.
 
 ## VAD
 
-`crates/whisperd/src/vad.rs` is a verbatim port of i3More's energy-based
-VAD (originally derived from `whisper.cpp/examples/common.cpp`):
+*(Rewritten in 06.)* The old `vad.rs` (i3More's fixed `mean |s| < 0.003`
+check) is gone. `crates/whisperd/src/voice.rs` is an adaptive voice tracker
+that is in the capture path: the segmenter feeds it every new sample.
 
-- `is_chunk_silent(samples, …)` — drop-silence guard. Useful before
-  invoking the worker to avoid the famous Whisper "Thank you." / "Music"
-  hallucination on quiet audio.
-- `is_speech_end(samples, …)` — sliding-window end-of-utterance detector.
-  **Unused in v1.** Kept because the streaming-mode roadmap (open-item:
-  partial transcripts during the press) will need exactly this.
+- It runs on 20 ms frames, after an 80 Hz high-pass that only feeds the
+  measurement. The PCM sent to Whisper is untouched.
+- It keeps a noise floor that adapts to the mic and the room. Voice starts
+  above 5× the floor and continues above 3× it, both clamped.
+- Voice must last 200 ms before it counts, so clicks and coughs don't.
+- It decides three things:
+  - where pieces are cut (500 ms of pause after voice)
+  - whether the final tail has voice; if not, it's never sent to Whisper
+  - when to auto-stop (30 s of captured audio without voice)
 
-For v1, VAD is *not* in the capture path. The hold-to-talk model already
-gives a precise speech window (press → release); we just transcribe the
-whole thing. The `vad` module is `#[allow(dead_code)]` in `main.rs` to
-suppress unused-import warnings until the streaming mode lands.
+The design and thresholds follow Myna's tracker; see
+`06-niri-toggle-ux.md` (P3).
 
 ---
 

@@ -51,8 +51,17 @@ install: build-release
     install -Dm755 target/release/whisperd  $HOME/.local/bin/whisperd
     install -Dm755 target/release/whisperctl $HOME/.local/bin/whisperctl
 
+# Restarts the daemon, so a fresh build takes effect.
+# Install + start the systemd user unit (niri or any Wayland session).
+install-service: install
+    install -Dm644 systemd/whisperd.service $HOME/.config/systemd/user/whisperd.service
+    systemctl --user daemon-reload
+    systemctl --user enable whisperd.service
+    systemctl --user restart whisperd.service
+    @echo "whisperd running: journalctl --user -fu whisperd"
+
 # Start the installed whisperd in the background. Logs to /tmp/whisperd.log.
-# Assumes `Thank you.install` (or `just gui-install`) has placed the binary on
+# Assumes `just install` (or `just gui-install`) has placed the binary on
 # PATH. Uses `nohup` so closing the shell does not kill it.
 daemon-start:
     @if pgrep -x whisperd >/dev/null; then \
@@ -72,11 +81,12 @@ daemon-stop:
 # Stop and re-start (used after `just install` / `just gui-install`).
 daemon-restart: daemon-stop daemon-start
 
+# Each cycle captures ~50 ms of silence, which the daemon now skips (no
+# voice → nothing typed, a "No speech detected" notice instead). Focus a
+# scratch terminal anyway in case something does get typed.
 # 50 rapid start/stop cycles — verification step 8 (stress).
-# WARNING: every cycle injects a (likely silent → "Thank you.") transcript
-# into the focused window. Focus a scratch terminal first.
 stress:
-    @echo "WARNING: 50 start/stop cycles will inject text into the focused window."
+    @echo "50 start/stop cycles; nothing should be typed (silence is skipped)."
     @echo "Press Ctrl-C in the next 3 seconds to abort."
     @sleep 3
     @for i in $$(seq 1 50); do \
@@ -105,3 +115,13 @@ gui-build:
 gui-install: gui-build
     install -Dm755 dist/whisperd-gui $HOME/.local/bin/whisperd
     @echo "GUI whisperd installed. Restart the daemon: just daemon-restart"
+
+# Record your voice for the voice-command accuracy test (one clip per
+# phrase in tests/fixtures/commands/phrases.tsv; clips stay local).
+record-commands:
+    bash scripts/record-commands.sh
+
+# Score the recorded commands: with and without hotwords. Compare models
+# with e.g. `just eval-commands tiny.en`.
+eval-commands model="base.en": build
+    WHISPER_STT_WAKE_MODEL={{model}} target/debug/whisperd --eval-commands tests/fixtures/commands

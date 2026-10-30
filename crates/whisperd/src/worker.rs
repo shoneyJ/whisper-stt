@@ -18,22 +18,31 @@ pub struct WorkerConfig {
     pub beam_size: Option<u32>,
 }
 
+/// The repo's `worker/` folder, fixed at build time. The daemon used to look
+/// for `./worker/...` relative to its working directory, so it failed when
+/// started from niri or systemd (cwd = `$HOME`) unless env vars pinned the
+/// paths. The env vars still override this.
+const WORKER_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../worker");
+
 impl WorkerConfig {
     pub fn from_env() -> Result<Self> {
-        let cwd = std::env::current_dir().context("current dir")?;
+        let worker_dir = PathBuf::from(WORKER_DIR);
         let python = std::env::var_os("WHISPER_STT_PYTHON")
             .map(PathBuf::from)
-            .unwrap_or_else(|| cwd.join("worker/.venv/bin/python"));
+            .unwrap_or_else(|| worker_dir.join(".venv/bin/python"));
         let script = std::env::var_os("WHISPER_STT_WORKER_SCRIPT")
             .map(PathBuf::from)
-            .unwrap_or_else(|| cwd.join("worker/whisper_worker.py"));
+            .unwrap_or_else(|| worker_dir.join("whisper_worker.py"));
         let model = std::env::var("WHISPER_STT_MODEL").unwrap_or_else(|_| "distil-large-v3".into());
         let device = std::env::var("WHISPER_STT_DEVICE").unwrap_or_else(|_| "cuda".into());
         let compute_type =
             std::env::var("WHISPER_STT_COMPUTE_TYPE").unwrap_or_else(|_| "float16".into());
-        let language = std::env::var("WHISPER_STT_LANGUAGE")
-            .ok()
-            .or(Some("en".into()));
+        // Unset: English. Set but empty: let Whisper detect the language.
+        let language = match std::env::var("WHISPER_STT_LANGUAGE") {
+            Ok(l) if l.trim().is_empty() => None,
+            Ok(l) => Some(l),
+            Err(_) => Some("en".into()),
+        };
         let beam_size = std::env::var("WHISPER_STT_BEAM_SIZE")
             .ok()
             .and_then(|s| s.parse().ok());
@@ -45,6 +54,22 @@ impl WorkerConfig {
             compute_type,
             language,
             beam_size,
+        })
+    }
+
+    /// The always-on wake listener's model: small and on the CPU, so it can
+    /// stay loaded without holding VRAM. base.en: ~1 s per 2 s clip here,
+    /// and 28/29 on the synthetic command eval against tiny.en's 24/29
+    /// (tiny garbled "Athena" into "a theta", "addina" once hotwords were
+    /// on). `WHISPER_STT_WAKE_MODEL` overrides the model.
+    pub fn wake_from_env() -> Result<Self> {
+        Ok(Self {
+            model: std::env::var("WHISPER_STT_WAKE_MODEL").unwrap_or_else(|_| "base.en".into()),
+            device: "cpu".into(),
+            compute_type: "int8".into(),
+            language: Some("en".into()),
+            beam_size: None,
+            ..Self::from_env()?
         })
     }
 }
@@ -141,9 +166,18 @@ impl WorkerHandle {
             .with_context(|| format!("parse worker event: {}", line.trim()))
     }
 
-    pub async fn transcribe(&mut self, pcm_b64: String, sr: u32) -> Result<TranscribeResult> {
-        self.send(&WorkerCommand::Transcribe { pcm_b64, sr })
-            .await?;
+    pub async fn transcribe(
+        &mut self,
+        pcm_b64: String,
+        sr: u32,
+        hotwords: Option<String>,
+    ) -> Result<TranscribeResult> {
+        self.send(&WorkerCommand::Transcribe {
+            pcm_b64,
+            sr,
+            hotwords,
+        })
+        .await?;
         match self.recv().await? {
             WorkerEvent::Transcript {
                 text,

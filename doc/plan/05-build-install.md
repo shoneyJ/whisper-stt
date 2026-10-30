@@ -50,23 +50,61 @@ install -Dm755 target/release/whisperd  ~/.local/bin/whisperd
 install -Dm755 target/release/whisperctl ~/.local/bin/whisperctl
 ```
 
-`whisperd` looks for the worker venv + script under the **current working
-directory** by default. When running it from a global location, point at the
-checkout explicitly:
+`whisperd` finds the worker venv and script in the repo it was **built
+from** (fixed at build time, *changed in 06*), so it works from any working
+directory: niri, systemd, a terminal. Override when needed:
 
 ```bash
-export WHISPER_STT_PYTHON=$HOME/projects/github/shoneyj/whisper-stt/worker/.venv/bin/python
-export WHISPER_STT_WORKER_SCRIPT=$HOME/projects/github/shoneyj/whisper-stt/worker/whisper_worker.py
+export WHISPER_STT_PYTHON=/path/to/venv/bin/python
+export WHISPER_STT_WORKER_SCRIPT=/path/to/whisper_worker.py
 ```
 
-A small launcher is the cleanest way to set those — drop this in
-`~/.local/bin/whisperd-launcher`:
+---
+
+## niri (Wayland)
+
+*(Added in 06; see `06-niri-toggle-ux.md`.)* niri has no key-release binds,
+so dictation is press to start, press to stop (`whisperctl toggle`).
+
+1. **Daemon as a user service.** `systemd/whisperd.service` is bound to
+   `graphical-session.target`. It needs no `DISPLAY` or path variables;
+   `WAYLAND_DISPLAY` comes from the user manager, which niri imports at
+   login (check with `systemctl --user show-environment`).
+
+   ```bash
+   just install-service          # build, install, enable, (re)start
+   journalctl --user -fu whisperd
+   ```
+
+2. **Key.** In `~/.config/niri/config.kdl`:
+
+   ```kdl
+   Mod+J repeat=false hotkey-overlay-title="Dictation (whisper-stt)" { spawn "/home/shoney/.local/bin/whisperctl" "toggle"; }
+   ```
+
+   `repeat=false` stops niri re-firing a held key. The daemon filters
+   repeats as well.
+
+3. **Bar pill (DankMaterialShell).** This is the `whisperStt` widget plugin
+   in the dotfiles (`dms/.config/DankMaterialShell/plugins/whisperStt/`).
+   It runs `whisperctl subscribe`:
+   - shows the state and a live mic level
+   - pulses while starting or transcribing
+   - raises a desktop notification on errors
+   - click toggles dictation, or starts the service if it's down
+
+   Enable it in `plugin_settings.json` and add it to a bar section in
+   `settings.json`.
+
+4. **Typing** uses `wtype` (`apt install wtype`). **Sounds** use `pw-play`
+   and the freedesktop sound theme (`WHISPER_STT_SOUNDS=0` turns them off).
+
+Quick checks:
 
 ```bash
-#!/usr/bin/env bash
-export WHISPER_STT_PYTHON=$HOME/projects/github/shoneyj/whisper-stt/worker/.venv/bin/python
-export WHISPER_STT_WORKER_SCRIPT=$HOME/projects/github/shoneyj/whisper-stt/worker/whisper_worker.py
-exec $HOME/.local/bin/whisperd "$@"
+whisperctl status                 # {"state":"idle", ...}
+whisperctl subscribe              # state_changed + level events while you dictate
+pactl get-source-volume @DEFAULT_SOURCE@   # quiet speech needs a sensible mic gain
 ```
 
 ---
@@ -92,7 +130,10 @@ deleting the marked block from `~/.config/i3/config`.
 
 ---
 
-## Autostart `whisperd` — systemd user unit (recommended)
+## Autostart `whisperd` — systemd user unit (i3 / X11)
+
+On niri use `just install-service` instead (above). The unit below is the
+original X11 one: `xdotool` needs `DISPLAY` and `XAUTHORITY`.
 
 Drop this in `~/.config/systemd/user/whisperd.service`:
 

@@ -1,7 +1,19 @@
 # Whisper STT
 
-Hold-to-talk dictation for editors and terminals on Linux + i3.
-Hold **F9**, speak English, release → transcribed text is typed at the cursor.
+Offline dictation for editors and terminals on Linux.
+
+- **niri / Wayland:** press **Super+J**, speak, press **Super+J** again. Text
+  is typed at the cursor clause by clause as you pause. Dictation stops on
+  its own after 30 s of silence. Start, stop and error sounds play, and a
+  DankMaterialShell bar pill shows the state and a live mic level.
+- **Voice commands (niri, tmux, Zen):** say **"Jarvis, switch to session
+  main"**, "Jarvis, split right", "Jarvis, new tab", "Jarvis, listen". While
+  dictating, a key name alone ("enter", "cancel", "run again") presses it
+  and "stop listening" stops; text dictated into a terminal is typed as a
+  command. Cheat sheet: [`doc/voice-commands.md`](doc/voice-commands.md)
+  (**Super+Alt+J**). Design: [`doc/plan/07-voice-commands.md`](doc/plan/07-voice-commands.md).
+- **i3 / X11 (original):** hold **F9**, speak, release.
+
 When idle, the model is unloaded so GPU/RAM is free.
 
 Architecture: [`doc/plan/01-architecture.md`](doc/plan/01-architecture.md).
@@ -27,9 +39,48 @@ v1 is feature-complete; v2 streaming and the cross-repo i3More pill have landed:
 - [x] **v2 systemd user unit** — auto-start on login + restart-on-crash (`~/.config/systemd/user/whisperd.service`)
 - [x] **i3More bar plugin** — `i3More/src/whisper_stt_indicator.rs` subscribes to the daemon and renders the state pill in the nav bar (no polling)
 
+niri toggle experience, modelled on Canonical Myna ([`doc/plan/06-niri-toggle-ux.md`](doc/plan/06-niri-toggle-ux.md)):
+
+- [x] **P1** No more "Thank you": silence/short-audio gate before Whisper + worker hallucination guards
+- [x] **P2** Repeat-filtered `toggle`, explicit state machine (`starting`, `notice`), daemon never blocks
+- [x] **P3** Adaptive voice tracker, pause-cut pieces, auto-stop on silence, live mic level
+- [x] **P4** Correct spacing between typed pieces
+- [x] **P5** Start / stop / error sound cues
+- [x] **P6** `message` on notices/errors, `level` events, transcript-free logs
+- [x] **P7** niri install: systemd unit, Super+J bind, DankMaterialShell bar pill
+- [x] **P8** Docs
+
+Voice commands ([`doc/plan/07-voice-commands.md`](doc/plan/07-voice-commands.md)):
+
+- [x] **V1** "Hey niri" wake phrase + tmux session commands (switch/next/previous/last), `whisperctl run`
+- [x] **V1.1** "start dictation", "enter" (wake and in dictation), "stop dictation"
+- [x] **V2.1–3** "listen"/"stop listening", focus-aware routing + terminal mode, terminal keys (cancel, clear, again, tab, escape, delete word, clear line)
+- [x] **V2.4–5** tmux windows/panes, Zen commands, "Jarvis" wake word, cheat sheet
+- [x] **V2.6–8** desktop commands (terminal/browser/workspace/maximize), accuracy test tooling (`just record-commands`, `just eval-commands`), hint card on "Jarvis"
+- [ ] Record your own clips and run the eval
+
 ---
 
 ## Quick start
+
+### niri (Wayland)
+
+```bash
+just worker-setup      # one-time: worker venv
+just model-pull        # one-time: ~1.5 GB model
+just install-service   # build, install to ~/.local/bin, enable + start the user unit
+```
+
+Then bind a key in niri:
+
+```kdl
+Mod+J repeat=false { spawn "whisperctl" "toggle"; }
+```
+
+Details, including the DMS bar pill, are in
+[`doc/plan/05-build-install.md`](doc/plan/05-build-install.md#niri-wayland).
+
+### i3 (X11)
 
 ```bash
 # 1. Build
@@ -90,12 +141,13 @@ Detailed install (launcher script, systemd user unit, troubleshooting):
 ## Configuration
 
 All knobs are environment variables. Defaults work out of the box on this
-target environment (X11 + i3 + PipeWire + RTX 4050).
+target environment (niri or i3 + PipeWire + RTX 4050). For the systemd
+unit, set them as `Environment=` lines in `systemd/whisperd.service`.
 
 | Var                            | Default              | Notes                                  |
 | ------------------------------ | -------------------- | -------------------------------------- |
-| `WHISPER_STT_PYTHON`           | `./worker/.venv/bin/python` | Worker venv interpreter         |
-| `WHISPER_STT_WORKER_SCRIPT`    | `./worker/whisper_worker.py` | Worker entry point             |
+| `WHISPER_STT_PYTHON`           | `<repo>/worker/.venv/bin/python` | Worker venv interpreter (repo = where the binary was built) |
+| `WHISPER_STT_WORKER_SCRIPT`    | `<repo>/worker/whisper_worker.py` | Worker entry point        |
 | `WHISPER_STT_MODEL`            | `distil-large-v3`    | faster-whisper alias or HF repo id     |
 | `WHISPER_STT_DEVICE`           | `cuda`               | Set `cpu` to fall back without GPU     |
 | `WHISPER_STT_COMPUTE_TYPE`     | `float16`            | `int8`, `int8_float16`, `float32` also |
@@ -103,6 +155,13 @@ target environment (X11 + i3 + PipeWire + RTX 4050).
 | `WHISPER_STT_BEAM_SIZE`        | `5`                  | 1 = greedy, faster + lower quality     |
 | `WHISPER_STT_SOURCE`           | (system default)     | Pin a specific PulseAudio source       |
 | `WHISPER_STT_IDLE_TIMEOUT_SECS`| `300`                | Worker is unloaded after this idle     |
+| `WHISPER_STT_SILENCE_TIMEOUT_SECS` | `30`             | Auto-stop after this much silence; `0` = never |
+| `WHISPER_STT_SOUNDS`           | `1`                  | `0` = no start/stop/error sounds       |
+| `WHISPER_STT_SOUND_DIR`        | `/usr/share/sounds/freedesktop/stereo` | Folder with `message-new-instant.oga`, `complete.oga`, `dialog-error.oga` |
+| `WHISPER_STT_WAKE`             | `1`                  | `0` = no always-on "Jarvis" listener |
+| `WHISPER_STT_WAKE_MODEL`       | `base.en`            | Wake/command model (always on the CPU, int8); `just eval-commands <model>` compares |
+| `WHISPER_STT_TMUX_SOCKET`      | (default server)     | tmux socket name (`tmux -L`) for voice commands |
+| `WHISPER_STT_DEBUG`            | unset                | `1` = log transcript text (otherwise only lengths) |
 | `WHISPER_STT_SOCK`             | `~/.cache/whisper-stt/whisperd.sock` | IPC socket path        |
 
 ---

@@ -127,16 +127,21 @@ mod gtk_main {
     fn state_text(state: DaemonState) -> &'static str {
         match state {
             DaemonState::Idle => "idle",
+            DaemonState::Starting => "starting",
             DaemonState::Listening => "listening",
             DaemonState::Transcribing => "transcribing",
+            DaemonState::Notice => "no speech",
             DaemonState::Error => "error",
+            DaemonState::Command => "command",
         }
     }
 
     fn state_class(state: DaemonState) -> &'static str {
         match state {
-            DaemonState::Idle => "state-idle",
-            DaemonState::Listening => "state-listening",
+            DaemonState::Idle | DaemonState::Notice => "state-idle",
+            DaemonState::Starting | DaemonState::Listening | DaemonState::Command => {
+                "state-listening"
+            }
             DaemonState::Transcribing => "state-transcribing",
             DaemonState::Error => "state-error",
         }
